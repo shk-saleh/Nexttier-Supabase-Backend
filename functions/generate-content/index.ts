@@ -1,12 +1,14 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { handleCors, jsonResponse } from "./cors.js";
+import { handleCors, jsonResponse } from "../_shared/cors.ts";
+import { buildJsonChatBody, parseJsonResponse } from "../_shared/llm.js";
 
-const BASE_CREDIT_COST = 5;
-const TOKENS_PER_CREDIT = 10;
+const BASE_CREDIT_COST = 4;
+const TOKENS_PER_CREDIT = 250;
+const MAX_VARIABLE_COST = 6;
 
 function calculateCreditCost(evalCount) {
-  const variableCost = Math.ceil(evalCount / TOKENS_PER_CREDIT);
+  const variableCost = Math.min(MAX_VARIABLE_COST, Math.ceil(evalCount / TOKENS_PER_CREDIT));
   return BASE_CREDIT_COST + variableCost;
 }
 
@@ -88,34 +90,59 @@ serve(async (req) => {
     }
 
     // Prompt
+    const systemPrompt = `
+You are a senior technical instructor and curriculum writer for an AI learning platform.
+Write only for technical topics such as computer science, software engineering, data science, cybersecurity, AI/ML, cloud, DevOps, networking, databases, systems, and mobile development.
+Teach in a production-quality style: clear, rigorous, practical, and comprehensive.
+Every lesson must include at least one real-world example and one case study or scenario.
+Explain concepts in a way that a motivated learner can understand without needing an external source.
+Avoid filler, repetition, and vague generalities.
+Return only valid JSON and no extra text.
+`.trim();
+
     const userPrompt = `
-Generate a structured lesson.
+Generate a comprehensive lesson.
 
 Course: ${course_title}
 Module: ${module_title}
 Lesson: ${lesson_title}
-Lesson Order: ${lesson_position} in Module ${module_position}
+Lesson order: ${lesson_position} in module ${module_position}
 Level: ${complexity}
 Goal: ${goal}
 
-Return JSON:
+Teaching requirements:
+- Explain the concept from first principles.
+- Include prerequisites or assumed knowledge.
+- Break the concept into clear sections.
+- Include at least one real-world example.
+- Include at least one real case study or scenario.
+- Include practical implications, common mistakes, and what to watch out for.
+- Include a code block only when it genuinely helps.
+- Make the lesson detailed enough that the student could learn the concept completely from this lesson alone.
+- Keep the tone instructional and professional.
+- Use plain language, but do not oversimplify.
+
+Return JSON in this exact shape:
 {
-  "title": "",
+  "title": "Lesson title",
   "content": [
-    { "type": "text", "value": "" },
-    { "type": "code", "value": "" },
-    { "type": "example", "value": "" },
-    { "type": "references", "value": "" }
+    { "type": "text", "value": "## Overview\\n\\n..." },
+    { "type": "text", "value": "## Why It Matters\\n\\n..." },
+    { "type": "text", "value": "## Core Concept\\n\\n..." },
+    { "type": "example", "value": "A real-world example with concrete details." },
+    { "type": "text", "value": "## Case Study\\n\\nA realistic scenario that shows the concept in action." },
+    { "type": "text", "value": "## Common Mistakes\\n\\n- ..." },
+    { "type": "code", "value": "..." },
+    { "type": "references", "value": "## Further Study\\n\\n- Related technical topics to revisit" }
   ],
-  "summary": ""
+  "summary": "One-paragraph takeaway"
 }
 
 Rules:
-- clear explanation
-- structured blocks
-- no markdown
-- valid JSON only
-`;
+- Return valid JSON only.
+- Do not use markdown fences outside the JSON string values.
+- Do not produce short or shallow content.
+`.trim();
 
     // AI Call
     const aiRes = await fetch("https://ollama.com/api/chat", {
@@ -124,38 +151,24 @@ Rules:
         "Authorization": `Bearer ${Deno.env.get("OLLAMA_API_KEY")}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: "gpt-oss:120b",
-        stream: false,
-        messages: [
-          { role: "system", content: "JSON only" },
-          { role: "user", content: userPrompt },
-        ],
-        options: {
+      body: JSON.stringify(
+        buildJsonChatBody({
+          systemPrompt,
+          userPrompt,
           temperature: 0.3,
-        },
-      }),
+          topP: 0.9,
+          repeatPenalty: 1.08,
+          numPredict: 2048,
+          numCtx: 6144,
+        })
+      ),
     });
 
     const aiData = await aiRes.json();
+    const lesson = parseJsonResponse(aiData);
 
-    const raw =
-      aiData?.message?.content ||
-      aiData?.choices?.[0]?.message?.content ||
-      "";
-
-    const match = raw.match(/\{[\s\S]*\}/);
-
-    if (!match) {
+    if (!lesson) {
       return jsonResponse({ error: "Invalid AI response" }, 500);
-    }
-
-    let lesson;
-
-    try {
-      lesson = JSON.parse(match[0]);
-    } catch {
-      return jsonResponse({ error: "Malformed JSON from AI" }, 500);
     }
 
     if (!lesson?.content || !Array.isArray(lesson.content)) {

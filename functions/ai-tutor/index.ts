@@ -1,12 +1,15 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { handleCors, jsonResponse } from "./cors.js";
+import { handleCors, jsonResponse } from "../_shared/cors.ts";
+import { buildJsonChatBody, parseJsonResponse } from "../_shared/llm.js";
+import { isTechTutorRequest, techOnlyRefusalMessage } from "../_shared/tech-domain.js";
 
 const BASE_CREDIT_COST = 3;
-const TOKENS_PER_CREDIT = 10;
+const TOKENS_PER_CREDIT = 250;
+const MAX_VARIABLE_COST = 4;
 
 function calculateCreditCost(evalCount) {
-  const variableCost = Math.ceil(evalCount / TOKENS_PER_CREDIT);
+  const variableCost = Math.min(MAX_VARIABLE_COST, Math.ceil(evalCount / TOKENS_PER_CREDIT));
   return BASE_CREDIT_COST + variableCost;
 }
 
@@ -55,20 +58,44 @@ serve(async (req) => {
       return jsonResponse({ error: "Invalid input provided" }, 400);
     }
 
+    if (!isTechTutorRequest(input)) {
+      return jsonResponse({
+        response: {
+          answer: techOnlyRefusalMessage(),
+          key_points: [],
+          example: "",
+        },
+      });
+    }
+
     // Prompt
+    const systemPrompt = `
+You are an expert technical tutor for an AI learning platform serving computer science, software engineering, data science, cybersecurity, AI/ML, cloud, DevOps, databases, networking, and related technical students.
+Answer only technical questions and career-relevant questions for those fields.
+If the request is unrelated to computing or technical learning, respond with a short polite refusal in the answer field and leave key_points and example empty.
+Do not answer irrelevant, unsafe, or off-topic requests.
+Return only valid JSON and no extra text.
+`.trim();
+
     const prompt = `
-You are an elite AI tutor...
+User message: ${input}
 
-Input:
-${input}
+Instructions:
+- Accept greetings and respond them in respectable way.
+- Give a helpful, accurate, and concise teaching response.
+- Explain the concept clearly and professionally.
+- Use the answer field for the main explanation.
+- Include 2 to 5 short key points that reinforce the idea.
+- Include one concrete example or scenario when appropriate.
+- If the message is outside technical education, set the answer to a short refusal.
 
-Return JSON:
+Return JSON in this exact shape:
 {
-  "answer": "",
-  "key_points": [],
-  "example": "",
+  "answer": "Main response",
+  "key_points": ["Point 1", "Point 2"],
+  "example": "Concrete example or scenario"
 }
-`;
+`.trim();
 
     // AI call (⚠️ your endpoint still questionable)
     const aiRes = await fetch("https://ollama.com/api/chat", {
@@ -77,32 +104,24 @@ Return JSON:
         "Authorization": `Bearer ${Deno.env.get("OLLAMA_API_KEY")}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: "gpt-oss:120b",
-        stream: false,
-        messages: [
-          { role: "system", content: "Return JSON only." },
-          { role: "user", content: prompt },
-        ],
-      }),
+      body: JSON.stringify(
+        buildJsonChatBody({
+          systemPrompt,
+          userPrompt: prompt,
+          temperature: 0.35,
+          topP: 0.9,
+          repeatPenalty: 1.05,
+          numPredict: 600,
+          numCtx: 4096,
+        })
+      ),
     });
 
     const aiData = await aiRes.json();
-    const raw =
-      aiData?.message?.content ||
-      aiData?.choices?.[0]?.message?.content ||
-      "";
+    const response = parseJsonResponse(aiData);
 
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) {
+    if (!response) {
       return jsonResponse({ error: "Invalid AI response" }, 500);
-    }
-
-    let response;
-    try {
-      response = JSON.parse(match[0]);
-    } catch {
-      return jsonResponse({ error: "Failed to parse AI response" }, 500);
     }
 
     // Credit logic

@@ -1,12 +1,14 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { handleCors, jsonResponse } from "./cors.js";
+import { handleCors, jsonResponse } from "../_shared/cors.ts";
+import { buildJsonChatBody, parseJsonResponse } from "../_shared/llm.js";
 
 const BASE_CREDIT_COST = 3;
-const TOKENS_PER_CREDIT = 8;
+const TOKENS_PER_CREDIT = 250;
+const MAX_VARIABLE_COST = 4;
 
 function calculateCreditCost(evalCount) {
-  const variableCost = Math.ceil(evalCount / TOKENS_PER_CREDIT);
+  const variableCost = Math.min(MAX_VARIABLE_COST, Math.ceil(evalCount / TOKENS_PER_CREDIT));
   return BASE_CREDIT_COST + variableCost;
 }
 
@@ -68,31 +70,45 @@ serve(async (req) => {
     }
 
     // Prompt
+    const systemPrompt = `
+You are a strict assessment designer for technical education.
+Create questions that test conceptual understanding, applied reasoning, and practical recall.
+Keep every question directly grounded in the lesson content.
+Do not create vague, trivial, or overly broad questions.
+Return only valid JSON and no extra text.
+`.trim();
+
     const userPrompt = `
 Generate a quiz based on this lesson.
 
-Lesson Title: ${lessonData.title}
-
-Content:
+Lesson title: ${lessonData.title}
+Lesson content:
 ${JSON.stringify(lessonData.content)}
 
-Return JSON:
+Quiz requirements:
+- Create 3 to 5 questions.
+- Every question must match the lesson content.
+- Each question must have exactly 4 answer options.
+- Only one option can be correct.
+- Distractors must be plausible and related to the topic.
+- Include a mix of recall, understanding, and applied thinking where possible.
+- Keep the quiz aligned with the lesson difficulty.
+
+Return JSON in this exact shape:
 {
   "quiz": [
     {
-      "question": "",
-      "options": ["", "", "", ""],
+      "question": "Question text",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
       "correctIndex": 0
     }
   ]
 }
 
 Rules:
-- 3 to 5 questions
-- 4 options each
-- only one correct answer
-- valid JSON only
-`;
+- Return valid JSON only.
+- Do not include explanations outside the JSON object.
+`.trim();
 
     // AI Call
     const aiRes = await fetch("https://ollama.com/api/chat", {
@@ -101,38 +117,24 @@ Rules:
         "Authorization": `Bearer ${Deno.env.get("OLLAMA_API_KEY")}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: "gpt-oss:120b",
-        stream: false,
-        messages: [
-          { role: "system", content: "JSON only" },
-          { role: "user", content: userPrompt },
-        ],
-        options: {
-          temperature: 0.3,
-        },
-      }),
+      body: JSON.stringify(
+        buildJsonChatBody({
+          systemPrompt,
+          userPrompt,
+          temperature: 0.15,
+          topP: 0.8,
+          repeatPenalty: 1.05,
+          numPredict: 800,
+          numCtx: 4096,
+        })
+      ),
     });
 
     const aiData = await aiRes.json();
+    const parsed = parseJsonResponse(aiData);
 
-    const raw =
-      aiData?.message?.content ||
-      aiData?.choices?.[0]?.message?.content ||
-      "";
-
-    const match = raw.match(/\{[\s\S]*\}/);
-
-    if (!match) {
+    if (!parsed) {
       return jsonResponse({ error: "Invalid AI response" }, 500);
-    }
-
-    let parsed;
-
-    try {
-      parsed = JSON.parse(match[0]);
-    } catch {
-      return jsonResponse({ error: "Malformed JSON from AI" }, 500);
     }
 
     const quiz = parsed?.quiz;
